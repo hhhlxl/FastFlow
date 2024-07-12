@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 import constants as const
 
-
 def subnet_conv_func(kernel_size, hidden_ratio):
     def subnet_conv(in_channels, out_channels):
         hidden_channels = int(in_channels * hidden_ratio)
@@ -21,6 +20,50 @@ def subnet_conv_func(kernel_size, hidden_ratio):
 
     return subnet_conv
 
+class CBAMLayer(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        # dim_in和dim_out是Fr传进来的
+        super().__init__()
+        reduction = 8
+        channel = dim_in
+        spatial_kernel = 5
+
+        # channel attention 压缩H,W为1
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+
+        # shared MLP
+        self.mlp = nn.Sequential(
+            # Conv2d比Linear方便操作
+            # nn.Linear(channel, channel // reduction, bias=False)
+            # 这一步是为了减少隐藏层的通道数，16会不会太大了。。
+            nn.Conv2d(channel, channel // reduction, 1, bias=False),
+            # inplace=True直接替换，节省内存
+            nn.ReLU(inplace=True),
+            # nn.Linear(channel // reduction, channel,bias=False)
+            nn.Conv2d(channel // reduction, channel, 1, bias=False)
+        )
+
+        # spatial attention
+        self.conv = nn.Conv2d(2, 1, kernel_size=spatial_kernel,
+                              padding=spatial_kernel // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        self.conv1x1 = nn.Conv2d(dim_in, dim_out, kernel_size=1)
+
+    def forward(self, x):
+        max_out = self.mlp(self.max_pool(x))
+        avg_out = self.mlp(self.avg_pool(x))
+        channel_out = self.sigmoid(max_out + avg_out)
+        x = channel_out * x
+
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        spatial_out = self.sigmoid(self.conv(torch.cat([max_out, avg_out], dim=1)))
+        x = spatial_out * x
+        # 增加通道数
+        output = self.conv1x1(x)
+        # 输出应该是64
+        return output
 
 def nf_fast_flow(input_chw, conv3x3_only, hidden_ratio, flow_steps, clamp=2.0):
     # 一个node即为一个INN块,INN块就是一个仿射结构
@@ -32,7 +75,8 @@ def nf_fast_flow(input_chw, conv3x3_only, hidden_ratio, flow_steps, clamp=2.0):
             kernel_size = 3
         nodes.append(
             Fm.AllInOneBlock,
-            subnet_constructor=subnet_conv_func(kernel_size, hidden_ratio),
+            subnet_constructor=CBAMLayer,
+            # subnet_constructor=subnet_conv_func(kernel_size, hidden_ratio),
             # 这个参数用于防止指数爆炸
             affine_clamping=clamp,
             permute_soft=False,
@@ -60,6 +104,7 @@ class FastFlow(nn.Module):
             self.feature_extractor = timm.create_model(backbone_name, pretrained=True)
             channels = [768]
             scales = [16]
+        # 如果是ResNet
         else:
             self.feature_extractor = timm.create_model(
                 backbone_name,

@@ -1,5 +1,6 @@
 import argparse
 import os
+import csv
 
 import torch
 import yaml
@@ -9,7 +10,7 @@ import constants as const
 import dataset
 import fastflow
 import utils
-import  numpy as np
+import numpy as np
 
 
 def build_train_data_loader(args, config):
@@ -94,9 +95,9 @@ def train_one_epoch(dataloader, model, optimizer, epoch):
                     epoch + 1, step + 1, loss_meter.val, loss_meter.avg
                 )
             )
+    return loss.item()
 
-
-def eval_once(dataloader, model):
+def eval_once(dataloader, model, epoch, checkpoint_dir):
     model.eval()
     auroc_metric_px = metrics.ROC_AUC()
     auroc_metric_im = metrics.ROC_AUC()
@@ -117,23 +118,20 @@ def eval_once(dataloader, model):
         targets = targets.cpu().numpy().astype(int)
         gt_list_sp = torch.Tensor([np.max(targets[i]) for i in range(targets.shape[0])])
         pr_list_sp = torch.Tensor([np.max(outputs[i]) for i in range(outputs.shape[0])])
-        print(gt_list_sp)
-        print(pr_list_sp)
+        # print(gt_list_sp)
+        # print(pr_list_sp)
         auroc_metric_im.update((pr_list_sp, gt_list_sp))
     auroc_px = auroc_metric_px.compute()
     auroc_im = auroc_metric_im.compute()
     print("Pixel-AUROC: {}".format(auroc_px))
     print("Image-AUROC: {}".format(auroc_im))
+    # 保存数据
+    with open(f'{checkpoint_dir}/results.csv', 'a', newline='') as file:  # 注意使用'a'来追加内容
+        writer = csv.writer(file)
+        writer.writerow([epoch + 1, auroc_px, auroc_im])
 
 
-def train(args):
-    os.makedirs(const.CHECKPOINT_DIR, exist_ok=True)
-    # checkpoint的保存路径
-    checkpoint_dir = os.path.join(
-        const.CHECKPOINT_DIR, "exp%d" % len(os.listdir(const.CHECKPOINT_DIR))
-    )
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
+def train(args, checkpoint_dir):
     # 加载config数据
     config = yaml.safe_load(open(args.config, "r"))
     model = build_model(config)
@@ -143,31 +141,47 @@ def train(args):
     test_dataloader = build_test_data_loader(args, config)
     model.cuda()
 
+    train_losses = []
+
+    with open(f'{checkpoint_dir}/results.csv', 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Epoch', 'Pixel-AUROC', 'Image-AUROC'])
+
+    with open(f'{checkpoint_dir}/losses.csv', 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Epoch', 'Loss_Val'])
+
     for epoch in range(const.NUM_EPOCHS):
-        train_one_epoch(train_dataloader, model, optimizer, epoch)
+        loss_this_epoch = train_one_epoch(train_dataloader, model, optimizer, epoch)
+        train_losses.append(loss_this_epoch)
         # 每隔一个EVAL_INTERVAL测试一次
         if (epoch + 1) % const.EVAL_INTERVAL == 0:
-            eval_once(test_dataloader, model)
+            eval_once(test_dataloader, model, epoch, checkpoint_dir)
+            with open(f'{checkpoint_dir}/losses.csv', 'a', newline='') as file:
+                writer = csv.writer(file)
+                for sub_epoch, loss in enumerate(train_losses, start=epoch-8):
+                    writer.writerow([sub_epoch, loss])
+            train_losses.clear()
         # 每隔一个CHECKPOINT_INTERVAL保存一次权重
-        if (epoch + 1) % const.CHECKPOINT_INTERVAL == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                },
-                os.path.join(checkpoint_dir, "%d.pt" % epoch),
-            )
+        # if (epoch + 1) % const.CHECKPOINT_INTERVAL == 0:
+        #     torch.save(
+        #         {
+        #             "epoch": epoch,
+        #             "model_state_dict": model.state_dict(),
+        #             "optimizer_state_dict": optimizer.state_dict(),
+        #         },
+        #         os.path.join(checkpoint_dir, "%d.pt" % epoch),
+        #     )
 
 
-def evaluate(args):
+def evaluate(args, checkpoint_dir):
     config = yaml.safe_load(open(args.config, "r"))
     model = build_model(config)
     checkpoint = torch.load(args.checkpoint)
     model.load_state_dict(checkpoint["model_state_dict"])
     test_dataloader = build_test_data_loader(args, config)
     model.cuda()
-    eval_once(test_dataloader, model)
+    eval_once(test_dataloader, model, 0, checkpoint_dir)
 
 
 def parse_args():
@@ -194,7 +208,13 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
+    os.makedirs(const.CHECKPOINT_DIR, exist_ok=True)
+    # checkpoint的保存路径
+    checkpoint_dir = os.path.join(
+        const.CHECKPOINT_DIR, "exp%d" % len(os.listdir(const.CHECKPOINT_DIR))
+    )
+    os.makedirs(checkpoint_dir, exist_ok=True)
     if args.eval:
-        evaluate(args)
+        evaluate(args, checkpoint_dir)
     else:
-        train(args)
+        train(args, checkpoint_dir)
